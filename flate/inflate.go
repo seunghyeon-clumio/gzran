@@ -9,6 +9,9 @@ package flate
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/gob"
+	"errors"
 	"io"
 	"math/bits"
 	"strconv"
@@ -24,6 +27,8 @@ const (
 	maxNumDist = 30
 	numCodes   = 19 // number of codes in Huffman meta-code
 )
+
+var ErrInvalidState = errors.New("flate: invalid decompressor state")
 
 // Initialize the fixedHuffmanDecoder only once upon first use.
 var fixedOnce sync.Once
@@ -102,10 +107,10 @@ const (
 )
 
 type huffmanDecoder struct {
-	min      int                      // the minimum code length
-	chunks   [huffmanNumChunks]uint32 // chunks as described above
-	links    [][]uint32               // overflow links
-	linkMask uint32                   // mask the width of the link table
+	Min      int                      // the minimum code length
+	Chunks   [huffmanNumChunks]uint32 // chunks as described above
+	Links    [][]uint32               // overflow links
+	LinkMask uint32                   // mask the width of the link table
 }
 
 // Initialize Huffman decoding tables from array of code lengths.
@@ -119,7 +124,7 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 	// development to supplement the currently ad-hoc unit tests.
 	const sanity = false
 
-	if h.min != 0 {
+	if h.Min != 0 {
 		*h = huffmanDecoder{}
 	}
 
@@ -168,23 +173,23 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 		return false
 	}
 
-	h.min = min
+	h.Min = min
 	if max > huffmanChunkBits {
 		numLinks := 1 << (uint(max) - huffmanChunkBits)
-		h.linkMask = uint32(numLinks - 1)
+		h.LinkMask = uint32(numLinks - 1)
 
 		// create link tables
 		link := nextcode[huffmanChunkBits+1] >> 1
-		h.links = make([][]uint32, huffmanNumChunks-link)
+		h.Links = make([][]uint32, huffmanNumChunks-link)
 		for j := uint(link); j < huffmanNumChunks; j++ {
 			reverse := int(bits.Reverse16(uint16(j)))
 			reverse >>= uint(16 - huffmanChunkBits)
 			off := j - uint(link)
-			if sanity && h.chunks[reverse] != 0 {
+			if sanity && h.Chunks[reverse] != 0 {
 				panic("impossible: overwriting existing chunk")
 			}
-			h.chunks[reverse] = uint32(off<<huffmanValueShift | (huffmanChunkBits + 1))
-			h.links[off] = make([]uint32, numLinks)
+			h.Chunks[reverse] = uint32(off<<huffmanValueShift | (huffmanChunkBits + 1))
+			h.Links[off] = make([]uint32, numLinks)
 		}
 	}
 
@@ -198,26 +203,26 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 		reverse := int(bits.Reverse16(uint16(code)))
 		reverse >>= uint(16 - n)
 		if n <= huffmanChunkBits {
-			for off := reverse; off < len(h.chunks); off += 1 << uint(n) {
+			for off := reverse; off < len(h.Chunks); off += 1 << uint(n) {
 				// We should never need to overwrite
 				// an existing chunk. Also, 0 is
 				// never a valid chunk, because the
 				// lower 4 "count" bits should be
 				// between 1 and 15.
-				if sanity && h.chunks[off] != 0 {
+				if sanity && h.Chunks[off] != 0 {
 					panic("impossible: overwriting existing chunk")
 				}
-				h.chunks[off] = chunk
+				h.Chunks[off] = chunk
 			}
 		} else {
 			j := reverse & (huffmanNumChunks - 1)
-			if sanity && h.chunks[j]&huffmanCountMask != huffmanChunkBits+1 {
+			if sanity && h.Chunks[j]&huffmanCountMask != huffmanChunkBits+1 {
 				// Longer codes should have been
 				// associated with a link table above.
 				panic("impossible: not an indirect chunk")
 			}
-			value := h.chunks[j] >> huffmanValueShift
-			linktab := h.links[value]
+			value := h.Chunks[j] >> huffmanValueShift
+			linktab := h.Links[value]
 			reverse >>= huffmanChunkBits
 			for off := reverse; off < len(linktab); off += 1 << uint(n-huffmanChunkBits) {
 				if sanity && linktab[off] != 0 {
@@ -232,7 +237,7 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 		// Above we've sanity checked that we never overwrote
 		// an existing entry. Here we additionally check that
 		// we filled the tables completely.
-		for i, chunk := range h.chunks {
+		for i, chunk := range h.Chunks {
 			if chunk == 0 {
 				// As an exception, in the degenerate
 				// single-code case, we allow odd
@@ -243,7 +248,7 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 				panic("impossible: missing chunk")
 			}
 		}
-		for _, linktab := range h.links {
+		for _, linktab := range h.Links {
 			for _, chunk := range linktab {
 				if chunk == 0 {
 					panic("impossible: missing chunk")
@@ -254,6 +259,14 @@ func (h *huffmanDecoder) init(lengths []int) bool {
 
 	return true
 }
+
+type inflateStep int
+
+const (
+	nextBlock inflateStep = iota
+	copyData
+	huffmanBlock
+)
 
 // The actual read interface needed by NewReader.
 // If the passed in io.Reader does not also have ReadByte,
@@ -288,7 +301,7 @@ type decompressor struct {
 
 	// Next step in the decompression,
 	// and decompression state.
-	step      func(*decompressor)
+	step      inflateStep
 	stepState int
 	final     bool
 	err       error
@@ -344,7 +357,14 @@ func (f *decompressor) Read(b []byte) (int, error) {
 		if f.err != nil {
 			return 0, f.err
 		}
-		f.step(f)
+		switch f.step {
+		case nextBlock:
+			f.nextBlock()
+		case copyData:
+			f.copyData()
+		case huffmanBlock:
+			f.huffmanBlock()
+		}
 		if f.err != nil && len(f.toRead) == 0 {
 			f.toRead = f.dict.readFlush() // Flush what's left in case of error
 		}
@@ -464,8 +484,8 @@ func (f *decompressor) readHuffman() error {
 	// for the HLIT tree to the length of the EOB marker since we know that
 	// every block must terminate with one. This preserves the property that
 	// we never read any extra bytes after the end of the DEFLATE stream.
-	if f.h1.min < f.bits[endBlockMarker] {
-		f.h1.min = f.bits[endBlockMarker]
+	if f.h1.Min < f.bits[endBlockMarker] {
+		f.h1.Min = f.bits[endBlockMarker]
 	}
 
 	return nil
@@ -503,7 +523,7 @@ readLiteral:
 			f.dict.writeByte(byte(v))
 			if f.dict.availWrite() == 0 {
 				f.toRead = f.dict.readFlush()
-				f.step = (*decompressor).huffmanBlock
+				f.step = huffmanBlock
 				f.stepState = stateInit
 				return
 			}
@@ -610,7 +630,7 @@ copyHistory:
 
 		if f.dict.availWrite() == 0 || f.copyLen > 0 {
 			f.toRead = f.dict.readFlush()
-			f.step = (*decompressor).huffmanBlock // We need to continue this work
+			f.step = huffmanBlock // We need to continue this work
 			f.stepState = stateDict
 			return
 		}
@@ -668,7 +688,7 @@ func (f *decompressor) copyData() {
 
 	if f.dict.availWrite() == 0 || f.copyLen > 0 {
 		f.toRead = f.dict.readFlush()
-		f.step = (*decompressor).copyData
+		f.step = copyData
 		return
 	}
 	f.finishBlock()
@@ -681,7 +701,7 @@ func (f *decompressor) finishBlock() {
 		}
 		f.err = io.EOF
 	}
-	f.step = (*decompressor).nextBlock
+	f.step = nextBlock
 }
 
 // noEOF returns err, unless err == io.EOF, in which case it returns io.ErrUnexpectedEOF.
@@ -709,7 +729,7 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 	// with single element, huffSym must error on these two edge cases. In both
 	// cases, the chunks slice will be 0 for the invalid sequence, leading it
 	// satisfy the n == 0 check below.
-	n := uint(h.min)
+	n := uint(h.Min)
 	// Optimization. Compiler isn't smart enough to keep f.b,f.nb in registers,
 	// but is smart enough to keep local variables in registers, so use nb and b,
 	// inline call to moreBits and reassign b,nb back to f on return.
@@ -726,10 +746,10 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 			b |= uint32(c) << (nb & 31)
 			nb += 8
 		}
-		chunk := h.chunks[b&(huffmanNumChunks-1)]
+		chunk := h.Chunks[b&(huffmanNumChunks-1)]
 		n = uint(chunk & huffmanCountMask)
 		if n > huffmanChunkBits {
-			chunk = h.links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&h.linkMask]
+			chunk = h.Links[chunk>>huffmanValueShift][(b>>huffmanChunkBits)&h.LinkMask]
 			n = uint(chunk & huffmanCountMask)
 		}
 		if n <= nb {
@@ -744,6 +764,48 @@ func (f *decompressor) huffSym(h *huffmanDecoder) (int, error) {
 			return int(chunk >> huffmanValueShift), nil
 		}
 	}
+}
+
+func DecompressorState(r io.ReadCloser) ([]byte, error) {
+	f, ok := r.(*decompressor)
+	if !ok {
+		return nil, errors.New("flate: ReadCloser is not a flate.Reader")
+	}
+
+	s := readerState{
+		Roffset:   f.roffset,
+		B:         f.b,
+		Nb:        f.nb,
+		H1:        f.h1,
+		H2:        f.h2,
+		Bits:      f.bits,
+		Codebits:  f.codebits,
+		Dict:      f.dict,
+		Step:      f.step,
+		StepState: f.stepState,
+		Final:     f.final,
+		ToRead:    f.toRead,
+		CopyLen:   f.copyLen,
+		CopyDist:  f.copyDist,
+	}
+
+	if f.hl == &f.h1 && f.hd == &f.h2 {
+		s.HuffmanTable = dynamicHuffmanTable
+	} else if f.hl == &fixedHuffmanDecoder && f.hd == nil {
+		s.HuffmanTable = fixedHuffmanTable
+	} else if f.hl == nil && f.hd == nil {
+		s.HuffmanTable = nilHuffmanTable
+	} else {
+		panic("flate: unexpected decompressor state")
+	}
+
+	var b bytes.Buffer
+	enc := gob.NewEncoder(&b)
+	if err := enc.Encode(s); err != nil {
+		panic(err)
+	}
+
+	return b.Bytes(), nil
 }
 
 func makeReader(r io.Reader) Reader {
@@ -779,7 +841,7 @@ func (f *decompressor) Reset(r io.Reader, dict []byte) error {
 		bits:     f.bits,
 		codebits: f.codebits,
 		dict:     f.dict,
-		step:     (*decompressor).nextBlock,
+		step:     nextBlock,
 	}
 	f.dict.init(maxMatchOffset, dict)
 	return nil
@@ -800,7 +862,7 @@ func NewReader(r io.Reader) io.ReadCloser {
 	f.r = makeReader(r)
 	f.bits = new([maxNumLit + maxNumDist]int)
 	f.codebits = new([numCodes]int)
-	f.step = (*decompressor).nextBlock
+	f.step = nextBlock
 	f.dict.init(maxMatchOffset, nil)
 	return &f
 }
@@ -819,7 +881,59 @@ func NewReaderDict(r io.Reader, dict []byte) io.ReadCloser {
 	f.r = makeReader(r)
 	f.bits = new([maxNumLit + maxNumDist]int)
 	f.codebits = new([numCodes]int)
-	f.step = (*decompressor).nextBlock
+	f.step = nextBlock
 	f.dict.init(maxMatchOffset, dict)
 	return &f
+}
+
+// NewReaderState is like NewReader but initializes the reader
+// with the given decompressor state. The returned Reader behaves
+// as if the decompressor had already read to the given point in the
+// data stream and had the given state. NewReaderState can be used to
+// resume decompression from a random offset where decompressor state
+// was previously saved.
+//
+// The ReadCloser returned by NewReader also implements Resetter.
+func NewReaderState(r io.Reader, state []byte) (io.ReadCloser, error) {
+	fixedHuffmanDecoderInit()
+
+	var s readerState
+	stateReader := bytes.NewReader(state)
+	dec := gob.NewDecoder(stateReader)
+	if err := dec.Decode(&s); err != nil {
+		return nil, err
+	}
+
+	f := decompressor{
+		r:         makeReader(r),
+		roffset:   s.Roffset,
+		b:         s.B,
+		nb:        s.Nb,
+		h1:        s.H1,
+		h2:        s.H2,
+		bits:      s.Bits,
+		codebits:  s.Codebits,
+		dict:      s.Dict,
+		step:      s.Step,
+		stepState: s.StepState,
+		final:     s.Final,
+		toRead:    s.ToRead,
+		copyLen:   s.CopyLen,
+		copyDist:  s.CopyDist,
+	}
+
+	switch s.HuffmanTable {
+	case nilHuffmanTable:
+		f.hl, f.hd = nil, nil
+	case fixedHuffmanTable:
+		f.hl = &fixedHuffmanDecoder
+		f.hd = nil
+	case dynamicHuffmanTable:
+		f.hl = &f.h1
+		f.hd = &f.h2
+	default:
+		return nil, ErrInvalidState
+	}
+
+	return &f, nil
 }
