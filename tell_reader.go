@@ -1,4 +1,4 @@
-package gzseek
+package gzran
 
 import (
 	"bufio"
