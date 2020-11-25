@@ -37,6 +37,8 @@ var (
 	ErrChecksum = errors.New("gzip: invalid checksum")
 	// ErrHeader is returned when reading GZIP data that has an invalid header.
 	ErrHeader = errors.New("gzip: invalid header")
+	// ErrInvalidSeek is returned if attempting to seek prior to beginning of the file.
+	ErrInvalidSeek = errors.New("gzseek: attempting to seek before beginning of file")
 	// ErrUnimplementedSeek is returned if attempting to seek from the end of the file.
 	ErrUnimplementedSeek = errors.New("gzseek: seek from SeekEnd is not implemented")
 )
@@ -252,7 +254,7 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 		z.size += uint32(int64(n) - startIdx)
 		z.furthestRead = z.pos
 	}
-	if z.pos >= z.Index.LastUncompressedOffset()+z.indexInterval {
+	if z.pos >= z.Index.lastUncompressedOffset()+z.indexInterval {
 		z.addPointToIndex()
 	}
 	if z.err != io.EOF {
@@ -298,7 +300,9 @@ func (z *Reader) addPointToIndex() {
 func (z *Reader) Seek(offset int64, whence int) (position int64, err error) {
 	switch whence {
 	case io.SeekStart:
-		if offset == z.pos {
+		if offset < 0 {
+			return z.pos, ErrInvalidSeek
+		} else if offset == z.pos {
 			return z.pos, nil
 		} else if offset > z.pos {
 			return z.seekForward(offset)
@@ -320,9 +324,7 @@ func (z *Reader) seekForward(offset int64) (position int64, err error) {
 		}
 	}
 	nBytesToSkip := offset - z.pos
-	n, err := io.CopyN(ioutil.Discard, z, nBytesToSkip)
-	z.pos += n
-	z.err = err
+	_, z.err = io.CopyN(ioutil.Discard, z, nBytesToSkip)
 	return z.pos, z.err
 }
 
@@ -337,7 +339,7 @@ func (z *Reader) seekBackward(offset int64) (position int64, err error) {
 
 func (z *Reader) seekToPoint(p Point) (position int64, err error) {
 	_, z.err = z.r.Seek(p.CompressedOffset, io.SeekStart)
-	if z.err == nil {
+	if z.err != nil {
 		return -1, z.err
 	}
 	z.bufR = newTellReader(z.r)

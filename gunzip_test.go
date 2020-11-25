@@ -7,6 +7,7 @@ package gzseek
 import (
 	"bytes"
 	"compress/flate"
+	"compress/gzip"
 	"encoding/base64"
 	"io"
 	"io/ioutil"
@@ -421,4 +422,182 @@ func TestTruncatedStreams(t *testing.T) {
 			t.Errorf("io.Copy(%d) on truncated stream: got %v, want %v", i, err, io.ErrUnexpectedEOF)
 		}
 	}
+}
+
+const seekTestData = "testdata/Isaac.Newton-Opticks.txt"
+
+func makeGzipTestData(t *testing.T, path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	var b bytes.Buffer
+	w := gzip.NewWriter(&b)
+	if _, err := io.Copy(w, f); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+type testSeekPoint struct {
+	offset int64
+	data   []byte
+}
+
+func makeTestSeekPoints(t *testing.T) []testSeekPoint {
+	f, err := os.Open(seekTestData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	testOffsets := []int64{578, 43499, 188888, 258888, 512256}
+	testPoints := make([]testSeekPoint, len(testOffsets))
+	for i, offset := range testOffsets {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		buf := make([]byte, 64)
+		if _, err := io.ReadFull(f, buf); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		testPoints[i] = testSeekPoint{offset, buf}
+	}
+
+	return testPoints
+}
+
+func TestSeekFromStart(t *testing.T) {
+	testPoints := makeTestSeekPoints(t)
+	for _, sp := range testPoints {
+		compressed := makeGzipTestData(t, seekTestData)
+		r := bytes.NewReader(compressed)
+		gzr, err := NewReader(r)
+		if err != nil {
+			t.Fatal(err)
+			continue
+		}
+
+		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		data := make([]byte, len(sp.data))
+		if _, err := io.ReadFull(gzr, data); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		if !equalBytes(data, sp.data) {
+			t.Errorf("offset %d: got %s, expected %s",
+				sp.offset, string(data), string(sp.data))
+		}
+	}
+}
+
+func TestSeekForwardBackward(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+	r := bytes.NewReader(compressed)
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	if _, err := io.CopyN(ioutil.Discard, gzr, 129); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	testPoints := makeTestSeekPoints(t)
+	for i := len(testPoints) - 1; i >= 0; i-- {
+		testPoints = append(testPoints, testPoints[i])
+	}
+
+	for _, sp := range testPoints {
+		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		data := make([]byte, len(sp.data))
+		if _, err := io.ReadFull(gzr, data); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		if !equalBytes(data, sp.data) {
+			t.Errorf("offset %d: got %s, expected %s",
+				sp.offset, string(data), string(sp.data))
+		}
+	}
+}
+
+func TestSeekRelative(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+	r := bytes.NewReader(compressed)
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	pos := int64(256000)
+	if _, err := io.CopyN(ioutil.Discard, gzr, pos); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	testPoints := makeTestSeekPoints(t)
+	for _, sp := range testPoints {
+		delta := sp.offset - pos
+		pos, err = gzr.Seek(delta, io.SeekCurrent)
+		if err != nil {
+			t.Error(err)
+			continue
+		} else if pos != sp.offset {
+			t.Errorf("Expected offset %d, got %d", sp.offset, pos)
+		}
+
+		data := make([]byte, len(sp.data))
+		n, err := io.ReadFull(gzr, data)
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		pos += int64(n)
+
+		if !equalBytes(data, sp.data) {
+			t.Errorf("offset %d:\ngot `%s`\n\nexpected: `%s`",
+				sp.offset, string(data), string(sp.data))
+		}
+	}
+}
+
+func equalBytes(b1, b2 []byte) bool {
+	if len(b1) != len(b2) {
+		return false
+	}
+
+	for i := 0; i < len(b1); i++ {
+		if b1[i] != b2[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func TestSeekAfterEOF(t *testing.T) {
+
 }
