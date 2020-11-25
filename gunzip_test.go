@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-package gzip
+package gzseek
 
 import (
 	"bytes"
@@ -53,27 +53,6 @@ var gunzipTests = []gunzipTest{
 		"hello.txt",
 		"hello world\n",
 		[]byte{
-			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
-			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
-			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00,
-		},
-		nil,
-	},
-	{ // concatenation
-		"hello.txt",
-		"hello.txt x2",
-		"hello world\n" +
-			"hello world\n",
-		[]byte{
-			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
-			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
-			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00,
 			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
 			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
 			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
@@ -237,20 +216,6 @@ var gunzipTests = []gunzipTest{
 		},
 		nil,
 	},
-	{ // has 1 non-empty fixed huffman block then garbage
-		"hello.txt",
-		"hello.txt + garbage",
-		"hello world\n",
-		[]byte{
-			0x1f, 0x8b, 0x08, 0x08, 0xc8, 0x58, 0x13, 0x4a,
-			0x00, 0x03, 0x68, 0x65, 0x6c, 0x6c, 0x6f, 0x2e,
-			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
-			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
-			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00, 'g', 'a', 'r', 'b', 'a', 'g', 'e', '!', '!', '!',
-		},
-		ErrHeader,
-	},
 	{ // has 1 non-empty fixed huffman block not enough header
 		"hello.txt",
 		"hello.txt + garbage",
@@ -261,7 +226,6 @@ var gunzipTests = []gunzipTest{
 			0x74, 0x78, 0x74, 0x00, 0xcb, 0x48, 0xcd, 0xc9,
 			0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1,
 			0x02, 0x00, 0x2d, 0x3b, 0x08, 0xaf, 0x0c, 0x00,
-			0x00, 0x00, gzipID1,
 		},
 		io.ErrUnexpectedEOF,
 	},
@@ -363,11 +327,6 @@ var gunzipTests = []gunzipTest{
 }
 
 func TestDecompressor(t *testing.T) {
-	// Keep resetting this reader.
-	// It is intended behavior that Reader.Reset can be called on a zero-value
-	// Reader and be the equivalent as if NewReader was used instead.
-	r1 := new(Reader)
-
 	b := new(bytes.Buffer)
 	for _, tt := range gunzipTests {
 		// Test NewReader.
@@ -390,26 +349,6 @@ func TestDecompressor(t *testing.T) {
 		if s != tt.raw {
 			t.Errorf("%s: got %d-byte %q want %d-byte %q", tt.desc, n, s, len(tt.raw), tt.raw)
 		}
-
-		// Test Reader.Reset.
-		in = bytes.NewReader(tt.gzip)
-		err = r1.Reset(in)
-		if err != nil {
-			t.Errorf("%s: Reset: %s", tt.desc, err)
-			continue
-		}
-		if tt.name != r1.Name {
-			t.Errorf("%s: got name %s", tt.desc, r1.Name)
-		}
-		b.Reset()
-		n, err = io.Copy(b, r1)
-		if err != tt.err {
-			t.Errorf("%s: io.Copy: %v want %v", tt.desc, err, tt.err)
-		}
-		s = b.String()
-		if s != tt.raw {
-			t.Errorf("%s: got %d-byte %q want %d-byte %q", tt.desc, n, s, len(tt.raw), tt.raw)
-		}
 	}
 }
 
@@ -423,7 +362,14 @@ func TestIssue6550(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gzip, err := NewReader(base64.NewDecoder(base64.StdEncoding, f))
+	dec := base64.NewDecoder(base64.StdEncoding, f)
+	var b bytes.Buffer
+	if _, err := io.Copy(&b, dec); err != nil {
+		t.Fatal(err)
+	}
+
+	r := bytes.NewReader(b.Bytes())
+	gzip, err := NewReader(r)
 	if err != nil {
 		t.Fatalf("NewReader(testdata/issue6550.gz): %v", err)
 	}
@@ -443,46 +389,6 @@ func TestIssue6550(t *testing.T) {
 		t.Errorf("Copy hung")
 	case <-done:
 		// ok
-	}
-}
-
-func TestMultistreamFalse(t *testing.T) {
-	// Find concatenation test.
-	var tt gunzipTest
-	for _, tt = range gunzipTests {
-		if strings.HasSuffix(tt.desc, " x2") {
-			goto Found
-		}
-	}
-	t.Fatal("cannot find hello.txt x2 in gunzip tests")
-
-Found:
-	br := bytes.NewReader(tt.gzip)
-	var r Reader
-	if err := r.Reset(br); err != nil {
-		t.Fatalf("first reset: %v", err)
-	}
-
-	// Expect two streams with "hello world\n", then real EOF.
-	const hello = "hello world\n"
-
-	r.Multistream(false)
-	data, err := ioutil.ReadAll(&r)
-	if string(data) != hello || err != nil {
-		t.Fatalf("first stream = %q, %v, want %q, %v", string(data), err, hello, nil)
-	}
-
-	if err := r.Reset(br); err != nil {
-		t.Fatalf("second reset: %v", err)
-	}
-	r.Multistream(false)
-	data, err = ioutil.ReadAll(&r)
-	if string(data) != hello || err != nil {
-		t.Fatalf("second stream = %q, %v, want %q, %v", string(data), err, hello, nil)
-	}
-
-	if err := r.Reset(br); err != io.EOF {
-		t.Fatalf("third reset: err=%v, want io.EOF", err)
 	}
 }
 

@@ -4,14 +4,15 @@
 
 // Package gzip implements reading and writing of gzip format compressed files,
 // as specified in RFC 1952.
-package gzip
+package gzseek
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
+	"io/ioutil"
 	"time"
 
 	"github.com/timpalpant/gzseek/flate"
@@ -28,11 +29,16 @@ const (
 	flagComment = 1 << 4
 )
 
+// DefaultIndexInterval is how often the reader will save decompressor state by default.
+const DefaultIndexInterval = 1024 * 1024 // 1 MB
+
 var (
 	// ErrChecksum is returned when reading GZIP data that has an invalid checksum.
 	ErrChecksum = errors.New("gzip: invalid checksum")
 	// ErrHeader is returned when reading GZIP data that has an invalid header.
 	ErrHeader = errors.New("gzip: invalid header")
+	// ErrUnimplementedSeek is returned if attempting to seek from the end of the file.
+	ErrUnimplementedSeek = errors.New("gzseek: seek from SeekEnd is not implemented")
 )
 
 var le = binary.LittleEndian
@@ -73,66 +79,56 @@ type Header struct {
 // returned by Read as tentative until they receive the io.EOF
 // marking the end of the data.
 type Reader struct {
-	Header       // valid after NewReader or Reader.Reset
-	r            flate.Reader
+	Header // valid after NewReader
+	Index  // valid after NewReader
+
+	r            io.ReadSeeker
+	bufR         *tellReader
 	decompressor io.ReadCloser
 	digest       uint32 // CRC-32, IEEE polynomial (section 8)
 	size         uint32 // Uncompressed size (section 2.3.1)
 	buf          [512]byte
 	err          error
-	multistream  bool
+
+	initialPos    int64 // Initial seek position of r when Reader was created.
+	pos           int64 // Current offset of Read() within the uncompressed data.
+	furthestRead  int64
+	indexInterval int64
 }
 
-// NewReader creates a new Reader reading the given reader.
+// NewReader creates a new Reader reading the given reader and default index interval.
 // If r does not also implement io.ByteReader,
 // the decompressor may read more data than necessary from r.
 //
 // It is the caller's responsibility to call Close on the Reader when done.
 //
 // The Reader.Header fields will be valid in the Reader returned.
-func NewReader(r io.Reader) (*Reader, error) {
-	z := new(Reader)
-	if err := z.Reset(r); err != nil {
-		return nil, err
-	}
-	return z, nil
+func NewReader(r io.ReadSeeker) (*Reader, error) {
+	return NewReaderInterval(r, DefaultIndexInterval)
 }
 
-// Reset discards the Reader z's state and makes it equivalent to the
-// result of its original state from NewReader, but reading from r instead.
-// This permits reusing a Reader rather than allocating a new one.
-func (z *Reader) Reset(r io.Reader) error {
-	*z = Reader{
-		decompressor: z.decompressor,
-		multistream:  true,
+// NewReaderInterval creates a new Reader consuming the given reader and
+// checkpointing decompressor state at the given index interval.
+// If r does not also implement io.ByteReader,
+// the decompressor may read more data than necessary from r.
+//
+// It is the caller's responsibility to call Close on the Reader when done.
+//
+// The Reader.Header fields will be valid in the Reader returned.
+func NewReaderInterval(r io.ReadSeeker, indexInterval int64) (*Reader, error) {
+	initialPos, err := r.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return nil, fmt.Errorf("gzseek: unable to determinine initial reader offset: %v", err)
 	}
-	if rr, ok := r.(flate.Reader); ok {
-		z.r = rr
-	} else {
-		z.r = bufio.NewReader(r)
+
+	z := &Reader{
+		r:             r,
+		bufR:          newTellReader(r),
+		indexInterval: indexInterval,
+		initialPos:    initialPos,
 	}
 	z.Header, z.err = z.readHeader()
-	return z.err
-}
-
-// Multistream controls whether the reader supports multistream files.
-//
-// If enabled (the default), the Reader expects the input to be a sequence
-// of individually gzipped data streams, each with its own header and
-// trailer, ending at EOF. The effect is that the concatenation of a sequence
-// of gzipped files is treated as equivalent to the gzip of the concatenation
-// of the sequence. This is standard behavior for gzip readers.
-//
-// Calling Multistream(false) disables this behavior; disabling the behavior
-// can be useful when reading file formats that distinguish individual gzip
-// data streams or mix gzip data streams with other data streams.
-// In this mode, when the Reader reaches the end of the data stream,
-// Read returns io.EOF. The underlying reader must implement io.ByteReader
-// in order to be left positioned just after the gzip stream.
-// To start the next stream, call z.Reset(r) followed by z.Multistream(false).
-// If there is no next stream, z.Reset(r) will return io.EOF.
-func (z *Reader) Multistream(ok bool) {
-	z.multistream = ok
+	return z, z.err
 }
 
 // readString reads a NUL-terminated string from z.r.
@@ -146,7 +142,7 @@ func (z *Reader) readString() (string, error) {
 		if i >= len(z.buf) {
 			return "", ErrHeader
 		}
-		z.buf[i], err = z.r.ReadByte()
+		z.buf[i], err = z.bufR.ReadByte()
 		if err != nil {
 			return "", err
 		}
@@ -173,7 +169,7 @@ func (z *Reader) readString() (string, error) {
 // readHeader reads the GZIP header according to section 2.3.1.
 // This method does not set z.err.
 func (z *Reader) readHeader() (hdr Header, err error) {
-	if _, err = io.ReadFull(z.r, z.buf[:10]); err != nil {
+	if _, err = io.ReadFull(z.bufR, z.buf[:10]); err != nil {
 		// RFC 1952, section 2.2, says the following:
 		//	A gzip file consists of a series of "members" (compressed data sets).
 		//
@@ -197,12 +193,12 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 	z.digest = crc32.ChecksumIEEE(z.buf[:10])
 
 	if flg&flagExtra != 0 {
-		if _, err = io.ReadFull(z.r, z.buf[:2]); err != nil {
+		if _, err = io.ReadFull(z.bufR, z.buf[:2]); err != nil {
 			return hdr, noEOF(err)
 		}
 		z.digest = crc32.Update(z.digest, crc32.IEEETable, z.buf[:2])
 		data := make([]byte, le.Uint16(z.buf[:2]))
-		if _, err = io.ReadFull(z.r, data); err != nil {
+		if _, err = io.ReadFull(z.bufR, data); err != nil {
 			return hdr, noEOF(err)
 		}
 		z.digest = crc32.Update(z.digest, crc32.IEEETable, data)
@@ -225,7 +221,7 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 	}
 
 	if flg&flagHdrCrc != 0 {
-		if _, err = io.ReadFull(z.r, z.buf[:2]); err != nil {
+		if _, err = io.ReadFull(z.bufR, z.buf[:2]); err != nil {
 			return hdr, noEOF(err)
 		}
 		digest := le.Uint16(z.buf[:2])
@@ -235,11 +231,7 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 	}
 
 	z.digest = 0
-	if z.decompressor == nil {
-		z.decompressor = flate.NewReader(z.r)
-	} else {
-		z.decompressor.(flate.Resetter).Reset(z.r, nil)
-	}
+	z.decompressor = flate.NewReader(z.bufR)
 	return hdr, nil
 }
 
@@ -250,15 +242,26 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 	}
 
 	n, z.err = z.decompressor.Read(p)
-	z.digest = crc32.Update(z.digest, crc32.IEEETable, p[:n])
-	z.size += uint32(n)
+
+	z.pos += int64(n)
+	// Is this read past the furthest point we have read before?
+	// If so then update size/digest with new data.
+	if z.pos > z.furthestRead {
+		startIdx := z.furthestRead - (z.pos - int64(n))
+		z.digest = crc32.Update(z.digest, crc32.IEEETable, p[startIdx:n])
+		z.size += uint32(int64(n) - startIdx)
+		z.furthestRead = z.pos
+	}
+	if z.pos >= z.Index.LastUncompressedOffset()+z.indexInterval {
+		z.addPointToIndex()
+	}
 	if z.err != io.EOF {
 		// In the normal case we return here.
 		return n, z.err
 	}
 
 	// Finished file; check checksum and size.
-	if _, err := io.ReadFull(z.r, z.buf[:8]); err != nil {
+	if _, err := io.ReadFull(z.bufR, z.buf[:8]); err != nil {
 		z.err = noEOF(err)
 		return n, z.err
 	}
@@ -269,22 +272,82 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 		return n, z.err
 	}
 	z.digest, z.size = 0, 0
+	return n, io.EOF
+}
 
-	// File is ok; check if there is another.
-	if !z.multistream {
-		return n, io.EOF
-	}
-	z.err = nil // Remove io.EOF
-
-	if _, z.err = z.readHeader(); z.err != nil {
-		return n, z.err
+func (z *Reader) addPointToIndex() {
+	state, err := flate.DecompressorState(z.decompressor)
+	if err != nil {
+		panic(err) // Error should be impossible since z is a flate.Reader.
 	}
 
-	// Read from next file, if necessary.
-	if n > 0 {
-		return n, nil
+	p := Point{
+		CompressedOffset:   z.bufR.Offset(),
+		UncompressedOffset: z.pos,
+		DecompressorState:  state,
 	}
-	return z.Read(p)
+
+	z.Index = append(z.Index, p)
+}
+
+// Seek implements io.Seeker.
+// The gzip file will be decompressed as needed to seek forward, building an index
+// of offsets as it does so. Subsequent calls to seek will use the index to skip
+// data more efficiently. Seeking from the end of the file is not implemented
+// and will return ErrUnimplemented.
+func (z *Reader) Seek(offset int64, whence int) (position int64, err error) {
+	switch whence {
+	case io.SeekStart:
+		if offset == z.pos {
+			return z.pos, nil
+		} else if offset > z.pos {
+			return z.seekForward(offset)
+		} else {
+			return z.seekBackward(offset)
+		}
+	case io.SeekCurrent:
+		return z.Seek(z.pos+offset, io.SeekStart)
+	default:
+		return z.pos, ErrUnimplementedSeek
+	}
+}
+
+func (z *Reader) seekForward(offset int64) (position int64, err error) {
+	seekPoint := z.Index.closestPointBefore(offset)
+	if seekPoint.UncompressedOffset > z.pos+z.indexInterval {
+		if pos, err := z.seekToPoint(seekPoint); err != nil {
+			return pos, err
+		}
+	}
+	nBytesToSkip := offset - z.pos
+	n, err := io.CopyN(ioutil.Discard, z, nBytesToSkip)
+	z.pos += n
+	z.err = err
+	return z.pos, z.err
+}
+
+func (z *Reader) seekBackward(offset int64) (position int64, err error) {
+	seekPoint := z.Index.closestPointBefore(offset)
+	if pos, err := z.seekToPoint(seekPoint); err != nil {
+		return pos, err
+	}
+	// We're now <= the desired offset, move forward as necessary to it.
+	return z.Seek(offset, io.SeekStart)
+}
+
+func (z *Reader) seekToPoint(p Point) (position int64, err error) {
+	_, z.err = z.r.Seek(p.CompressedOffset, io.SeekStart)
+	if z.err == nil {
+		return -1, z.err
+	}
+	z.bufR = newTellReader(z.r)
+	if p.CompressedOffset == 0 { // Beginning of file.
+		z.Header, z.err = z.readHeader()
+	} else {
+		z.decompressor, z.err = flate.NewReaderState(z.bufR, p.DecompressorState)
+	}
+	z.pos = p.UncompressedOffset
+	return z.pos, z.err
 }
 
 // Close closes the Reader. It does not close the underlying io.Reader.
