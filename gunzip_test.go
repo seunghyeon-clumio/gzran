@@ -456,7 +456,7 @@ func makeTestSeekPoints(t *testing.T) []testSeekPoint {
 	}
 	defer f.Close()
 
-	testOffsets := []int64{578, 43499, 188888, 258888, 512256}
+	testOffsets := []int64{0, 578, 43499, 188888, 258888, 512256}
 	testPoints := make([]testSeekPoint, len(testOffsets))
 	for i, offset := range testOffsets {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
@@ -477,16 +477,24 @@ func makeTestSeekPoints(t *testing.T) []testSeekPoint {
 }
 
 func TestSeekFromStart(t *testing.T) {
-	testPoints := makeTestSeekPoints(t)
-	for _, sp := range testPoints {
-		compressed := makeGzipTestData(t, seekTestData)
-		r := bytes.NewReader(compressed)
-		gzr, err := NewReader(r)
-		if err != nil {
-			t.Fatal(err)
-			continue
-		}
+	compressed := makeGzipTestData(t, seekTestData)
+	r := bytes.NewReader(compressed)
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
 
+	testSeekPoints(t, gzr)
+}
+
+func testSeekPoints(t *testing.T, gzr io.ReadSeeker) {
+	testPoints := makeTestSeekPoints(t)
+	for i := len(testPoints) - 1; i >= 0; i-- {
+		testPoints = append(testPoints, testPoints[i])
+	}
+
+	for _, sp := range testPoints {
 		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
 			t.Error(err)
 			continue
@@ -514,33 +522,12 @@ func TestSeekForwardBackward(t *testing.T) {
 		return
 	}
 
-	if _, err := io.CopyN(ioutil.Discard, gzr, 129); err != nil {
+	if _, err := io.CopyN(ioutil.Discard, gzr, 128000); err != nil {
 		t.Fatal(err)
 		return
 	}
 
-	testPoints := makeTestSeekPoints(t)
-	for i := len(testPoints) - 1; i >= 0; i-- {
-		testPoints = append(testPoints, testPoints[i])
-	}
-
-	for _, sp := range testPoints {
-		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
-			t.Error(err)
-			continue
-		}
-
-		data := make([]byte, len(sp.data))
-		if _, err := io.ReadFull(gzr, data); err != nil {
-			t.Error(err)
-			continue
-		}
-
-		if !equalBytes(data, sp.data) {
-			t.Errorf("offset %d: got %s, expected %s",
-				sp.offset, string(data), string(sp.data))
-		}
-	}
+	testSeekPoints(t, gzr)
 }
 
 func TestSeekRelative(t *testing.T) {
@@ -584,6 +571,24 @@ func TestSeekRelative(t *testing.T) {
 	}
 }
 
+func TestSeekAfterEOF(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+	r := bytes.NewReader(compressed)
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	// Read all data to end of file
+	if _, err := io.Copy(ioutil.Discard, gzr); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	testSeekPoints(t, gzr)
+}
+
 func equalBytes(b1, b2 []byte) bool {
 	if len(b1) != len(b2) {
 		return false
@@ -596,8 +601,4 @@ func equalBytes(b1, b2 []byte) bool {
 	}
 
 	return true
-}
-
-func TestSeekAfterEOF(t *testing.T) {
-
 }
