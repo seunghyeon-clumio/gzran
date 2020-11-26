@@ -35,14 +35,14 @@ func (idx Index) lastUncompressedOffset() int64 {
 
 func (idx Index) closestPointBefore(offset int64) Point {
 	j := sort.Search(len(idx), func(j int) bool {
-		return idx[j].UncompressedOffset <= offset
+		return idx[j].UncompressedOffset > offset
 	})
 
-	if j == len(idx) {
+	if j == 0 {
 		return Point{}
 	}
 
-	return idx[j]
+	return idx[j-1]
 }
 
 // Point holds the decompressor state at a given offset within the uncompressed data.
