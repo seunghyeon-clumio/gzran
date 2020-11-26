@@ -1,3 +1,3 @@
-module github.com/timpalpant/gzseek
+module github.com/timpalpant/gzran
 
 go 1.15

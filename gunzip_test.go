@@ -488,31 +488,6 @@ func TestSeekFromStart(t *testing.T) {
 	testSeekPoints(t, gzr)
 }
 
-func testSeekPoints(t *testing.T, gzr io.ReadSeeker) {
-	testPoints := makeTestSeekPoints(t)
-	for i := len(testPoints) - 1; i >= 0; i-- {
-		testPoints = append(testPoints, testPoints[i])
-	}
-
-	for _, sp := range testPoints {
-		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
-			t.Error(err)
-			continue
-		}
-
-		data := make([]byte, len(sp.data))
-		if _, err := io.ReadFull(gzr, data); err != nil {
-			t.Error(err)
-			continue
-		}
-
-		if !equalBytes(data, sp.data) {
-			t.Errorf("offset %d: got %s, expected %s",
-				sp.offset, string(data), string(sp.data))
-		}
-	}
-}
-
 func TestSeekForwardBackward(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
@@ -587,6 +562,103 @@ func TestSeekAfterEOF(t *testing.T) {
 	}
 
 	testSeekPoints(t, gzr)
+}
+
+func TestSeekWithInitialOffset(t *testing.T) {
+	prefix := []byte{1, 2, 3, 4, 5}
+	compressed := makeGzipTestData(t, seekTestData)
+	compressed = append(prefix, compressed...)
+	r := bytes.NewReader(compressed)
+	if _, err := r.Seek(int64(len(prefix)), io.SeekStart); err != nil {
+		t.Fatal(err)
+		return
+	}
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	testSeekPoints(t, gzr)
+}
+
+func TestSeekWithReloadedIndex(t *testing.T) {
+	compressed := makeGzipTestData(t, seekTestData)
+	r := bytes.NewReader(compressed)
+	gzr, err := NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	// Read all data to end of file
+	if _, err := io.Copy(ioutil.Discard, gzr); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	// Save Index.
+	var b bytes.Buffer
+	if err := gzr.Index.WriteTo(&b); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	if err := gzr.Close(); err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	// Reload Index.
+	index, err := LoadIndex(&b)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+
+	// Create a new reader with the reloaded index.
+	r = bytes.NewReader(compressed)
+	gzr, err = NewReader(r)
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	gzr.Index = index
+
+	testSeekPoints(t, gzr)
+}
+
+func testSeekPoints(t *testing.T, gzr *Reader) {
+	testPoints := makeTestSeekPoints(t)
+	for i := len(testPoints) - 1; i >= 0; i-- {
+		testPoints = append(testPoints, testPoints[i])
+	}
+
+	for _, sp := range testPoints {
+		if _, err := gzr.Seek(sp.offset, io.SeekStart); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		data := make([]byte, len(sp.data))
+		if _, err := io.ReadFull(gzr, data); err != nil {
+			t.Error(err)
+			continue
+		}
+
+		if !equalBytes(data, sp.data) {
+			t.Errorf("offset %d: got %s, expected %s",
+				sp.offset, string(data), string(sp.data))
+		}
+	}
+
+	if _, err := io.Copy(ioutil.Discard, gzr); err != nil {
+		t.Error(err)
+	}
+
+	if err := gzr.Close(); err != nil {
+		t.Error(err)
+	}
 }
 
 func equalBytes(b1, b2 []byte) bool {

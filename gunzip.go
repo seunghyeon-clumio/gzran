@@ -33,13 +33,12 @@ package gzran
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"io"
 	"io/ioutil"
 	"time"
 
-	"github.com/timpalpant/gzseek/flate"
+	"github.com/timpalpant/gzran/flate"
 )
 
 const (
@@ -116,9 +115,9 @@ type Reader struct {
 	buf          [512]byte
 	err          error
 
-	initialPos    int64 // Initial seek position of r when Reader was created.
 	pos           int64 // Current offset of Read() within the uncompressed data.
 	furthestRead  int64
+	checkedDigest bool
 	indexInterval int64
 }
 
@@ -142,16 +141,19 @@ func NewReader(r io.ReadSeeker) (*Reader, error) {
 //
 // The Reader.Header fields will be valid in the Reader returned.
 func NewReaderInterval(r io.ReadSeeker, indexInterval int64) (*Reader, error) {
-	initialPos, err := r.Seek(0, io.SeekCurrent)
+	bufR, err := newTellReader(r)
 	if err != nil {
-		return nil, fmt.Errorf("gzseek: unable to determinine initial reader offset: %v", err)
+		return nil, err
 	}
 
 	z := &Reader{
+		Index: Index{{
+			CompressedOffset:   bufR.Offset(),
+			UncompressedOffset: 0,
+		}},
 		r:             r,
-		bufR:          newTellReader(r),
+		bufR:          bufR,
 		indexInterval: indexInterval,
-		initialPos:    initialPos,
 	}
 	z.Header, z.err = z.readHeader()
 	return z, z.err
@@ -216,6 +218,7 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 	}
 	// z.buf[8] is XFL and is currently ignored.
 	hdr.OS = z.buf[9]
+	prevDigest := z.digest
 	z.digest = crc32.ChecksumIEEE(z.buf[:10])
 
 	if flg&flagExtra != 0 {
@@ -256,7 +259,7 @@ func (z *Reader) readHeader() (hdr Header, err error) {
 		}
 	}
 
-	z.digest = 0
+	z.digest = prevDigest
 	z.decompressor = flate.NewReader(z.bufR)
 	return hdr, nil
 }
@@ -274,8 +277,9 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 	// If so then update size/digest with new data.
 	if z.pos > z.furthestRead {
 		startIdx := z.furthestRead - (z.pos - int64(n))
-		z.digest = crc32.Update(z.digest, crc32.IEEETable, p[startIdx:n])
-		z.size += uint32(int64(n) - startIdx)
+		newData := p[startIdx:n]
+		z.digest = crc32.Update(z.digest, crc32.IEEETable, newData)
+		z.size += uint32(len(newData))
 		z.furthestRead = z.pos
 	}
 	if z.pos >= z.Index.lastUncompressedOffset()+z.indexInterval {
@@ -291,12 +295,16 @@ func (z *Reader) Read(p []byte) (n int, err error) {
 		z.err = noEOF(err)
 		return n, z.err
 	}
+	if z.checkedDigest {
+		return n, io.EOF
+	}
 	digest := le.Uint32(z.buf[:4])
 	size := le.Uint32(z.buf[4:8])
 	if digest != z.digest || size != z.size {
 		z.err = ErrChecksum
 		return n, z.err
 	}
+	z.checkedDigest = true
 	z.digest, z.size = 0, 0
 	return n, io.EOF
 }
@@ -366,8 +374,11 @@ func (z *Reader) seekToPoint(p Point) (position int64, err error) {
 	if z.err != nil {
 		return -1, z.err
 	}
-	z.bufR = newTellReader(z.r)
-	if p.CompressedOffset == 0 { // Beginning of file.
+	z.bufR, z.err = newTellReader(z.r)
+	if z.err != nil {
+		return -1, z.err
+	}
+	if p.UncompressedOffset == 0 { // Beginning of file.
 		z.Header, z.err = z.readHeader()
 	} else {
 		z.decompressor, z.err = flate.NewReaderState(z.bufR, p.DecompressorState)
