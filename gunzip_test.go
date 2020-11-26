@@ -425,6 +425,7 @@ func TestTruncatedStreams(t *testing.T) {
 }
 
 const seekTestData = "testdata/Isaac.Newton-Opticks.txt"
+const seekTestInterval = 16 * 1024
 
 func makeGzipTestData(t *testing.T, path string) []byte {
 	f, err := os.Open(path)
@@ -479,7 +480,7 @@ func makeTestSeekPoints(t *testing.T) []testSeekPoint {
 func TestSeekFromStart(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -491,7 +492,7 @@ func TestSeekFromStart(t *testing.T) {
 func TestSeekForwardBackward(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -508,7 +509,7 @@ func TestSeekForwardBackward(t *testing.T) {
 func TestSeekRelative(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -549,7 +550,7 @@ func TestSeekRelative(t *testing.T) {
 func TestSeekAfterEOF(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -573,7 +574,7 @@ func TestSeekWithInitialOffset(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
@@ -585,7 +586,7 @@ func TestSeekWithInitialOffset(t *testing.T) {
 func TestSeekWithReloadedIndex(t *testing.T) {
 	compressed := makeGzipTestData(t, seekTestData)
 	r := bytes.NewReader(compressed)
-	gzr, err := NewReader(r)
+	gzr, err := NewReaderInterval(r, seekTestInterval)
 	if err != nil {
 		t.Fatal(err)
 		return
