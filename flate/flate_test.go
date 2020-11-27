@@ -10,6 +10,7 @@ package flate
 
 import (
 	"bytes"
+	"compress/flate"
 	"encoding/hex"
 	"io"
 	"io/ioutil"
@@ -313,7 +314,7 @@ func TestReaderEarlyEOF(t *testing.T) {
 			earlyEOF := true // Do we expect early io.EOF?
 
 			var buf bytes.Buffer
-			w, _ := NewWriter(&buf, 5)
+			w, _ := flate.NewWriter(&buf, 5)
 			w.Write(data[:sz])
 			if flush {
 				// If a Flush occurs after all the actual data, the flushing

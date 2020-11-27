@@ -6,7 +6,6 @@ package gzran
 
 import (
 	"bytes"
-	"compress/flate"
 	"compress/gzip"
 	"encoding/base64"
 	"io"
@@ -415,9 +414,6 @@ func TestTruncatedStreams(t *testing.T) {
 			continue
 		}
 		_, err = io.Copy(ioutil.Discard, r)
-		if ferr, ok := err.(*flate.ReadError); ok {
-			err = ferr.Err
-		}
 		if err != io.ErrUnexpectedEOF {
 			t.Errorf("io.Copy(%d) on truncated stream: got %v, want %v", i, err, io.ErrUnexpectedEOF)
 		}

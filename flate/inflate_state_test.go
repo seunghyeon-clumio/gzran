@@ -2,6 +2,7 @@ package flate
 
 import (
 	"bytes"
+	"compress/flate"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -25,7 +26,7 @@ func TestRestoreState(t *testing.T) {
 	defer f.Close()
 
 	var b bytes.Buffer
-	w, err := NewWriter(&b, DefaultCompression)
+	w, err := flate.NewWriter(&b, flate.DefaultCompression)
 	if err != nil {
 		t.Error(err)
 	}

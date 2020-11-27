@@ -6,6 +6,7 @@ package flate
 
 import (
 	"bytes"
+	"compress/flate"
 	"io"
 	"io/ioutil"
 	"strings"
@@ -20,7 +21,7 @@ func TestReset(t *testing.T) {
 
 	deflated := make([]bytes.Buffer, 2)
 	for i, s := range ss {
-		w, _ := NewWriter(&deflated[i], 1)
+		w, _ := flate.NewWriter(&deflated[i], 1)
 		w.Write([]byte(s))
 		w.Close()
 	}
@@ -76,7 +77,7 @@ func TestResetDict(t *testing.T) {
 
 	deflated := make([]bytes.Buffer, len(ss))
 	for i, s := range ss {
-		w, _ := NewWriterDict(&deflated[i], DefaultCompression, dict)
+		w, _ := flate.NewWriterDict(&deflated[i], flate.DefaultCompression, dict)
 		w.Write([]byte(s))
 		w.Close()
 	}
