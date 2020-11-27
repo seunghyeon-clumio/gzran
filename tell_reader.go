@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/timpalpant/gzran/flate"
+	"github.com/timpalpant/gzran/internal/flate"
 )
 
 // tellReader is a bufio.Reader that also tracks its offset

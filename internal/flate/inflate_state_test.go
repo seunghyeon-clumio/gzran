@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-const testDat = "../testdata/Isaac.Newton-Opticks.txt"
+const testDat = "../../testdata/Isaac.Newton-Opticks.txt"
 
 type testState struct {
 	remaining []byte

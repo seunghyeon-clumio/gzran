@@ -38,7 +38,7 @@ import (
 	"io/ioutil"
 	"time"
 
-	"github.com/timpalpant/gzran/flate"
+	"github.com/timpalpant/gzran/internal/flate"
 )
 
 const (
