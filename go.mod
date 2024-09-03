@@ -1,3 +1,3 @@
 module github.com/timpalpant/gzran
 
-go 1.15
+go 1.22.6
